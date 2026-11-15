@@ -8,6 +8,7 @@ import type { TreeNode } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { effectiveDatabaseTypeForConnection, connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionTableSqlSchema } from "@/lib/database/jdbcDialect";
+import { dataTabsShareConnectionPool } from "@/lib/database/databaseDriverManifest";
 import { getCachedTableMetadata, loadTableMetadata, TABLE_METADATA_CACHE_TTL_MS, tableMetadataToDataTabMeta } from "@/lib/metadata/tableMetadataCache";
 import { canApplyDataTabMetadata, dataTabMetadataNeedsRefresh, findExistingDataTabCandidate, isDataTabMetadataLifecycleStale, type DataTabOpenMode, type DataTabReuseMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
@@ -78,10 +79,13 @@ export function useSidebarDataOpenRuntime() {
     // table-metadata load instead of the visible loading spinner.
     const warmTabSessionPool = (targetTabId: string) => {
       if (!config) return;
+      // Engines whose Agent pins a connection per session share the database pool, so warm
+      // that pool instead of pre-creating a tab session that would hold an extra connection.
+      const sharesPool = dataTabsShareConnectionPool(config.db_type);
       connectionStore.warmConnection(node.connectionId, {
         database: dataTabExecutionDatabase(config, node.database, node.catalog),
         catalog: node.catalog,
-        clientSessionId: targetTabId,
+        clientSessionId: sharesPool ? undefined : targetTabId,
       });
     };
     openDataLog("info", "start", {

@@ -78,7 +78,21 @@ struct EphemeralAgentMetadataSession {
 impl EphemeralAgentMetadataSession {
     async fn open(state: &AppState, connection_id: &str, database: Option<&str>, task_kind: &str) -> Self {
         let db_config = connection_config(state, connection_id).await;
-        let client_session_id = ephemeral_agent_metadata_session_id(db_config.as_ref(), task_kind);
+        let ephemeral_session_id = ephemeral_agent_metadata_session_id(db_config.as_ref(), task_kind);
+        // When the client already holds a pool for this database (the connection the user
+        // opened or the table-data tab they are looking at), borrow that live session for
+        // this read-only metadata read instead of opening a fresh Agent session and closing
+        // it right after. The pool resolver below does the actual borrow; skipping the
+        // ephemeral session here keeps the "no dedicated session" decision in one place.
+        let client_session_id =
+            match (ephemeral_session_id, database.map(str::trim).filter(|database| !database.is_empty())) {
+                (Some(_), Some(database))
+                    if state.borrowable_metadata_pool_key_for_database(connection_id, database).await.is_some() =>
+                {
+                    None
+                }
+                (ephemeral_session_id, _) => ephemeral_session_id,
+            };
         let cleanup_guard = match client_session_id.as_deref() {
             Some(client_session_id) => {
                 state.metadata_session_pool_cleanup_guard(connection_id, database, client_session_id).await

@@ -1475,6 +1475,61 @@ fn metadata_pool_database<'a>(config: Option<&ConnectionConfig>, database: Optio
     }
 }
 
+/// Database families whose metadata surface is read-only catalog/Agent work.
+///
+/// For these families a live pool that is already connected to the browsed database can
+/// serve a metadata read without changing the session (no `USE`, no `SET`), so the object
+/// browser may borrow an existing pool instead of opening a dedicated metadata pool and its
+/// physical connections. MySQL-family and SQL Server pools are deliberately excluded: their
+/// metadata paths rely on the pool's own `USE`/`SET` state, which a user tab session owns.
+fn metadata_may_borrow_open_pool(db_type: DatabaseType) -> bool {
+    matches!(
+        db_type,
+        DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::Gaussdb
+            | DatabaseType::OpenGauss
+            | DatabaseType::Kwdb
+            | DatabaseType::Questdb
+            | DatabaseType::Kingbase
+            | DatabaseType::Vastbase
+            | DatabaseType::Highgo
+            | DatabaseType::Gbase8c
+    ) || database_capabilities::is_agent_type(&db_type)
+}
+
+/// Database the connection-level pool published by `connect_db` is connected to.
+///
+/// Native PostgreSQL-family pools keep whatever the saved config asked for (`None` means
+/// the server-side default, which cannot be matched safely). Agent pools receive the
+/// effective database — including `ConnectionConfig::default_database()` fallbacks such as
+/// KingbaseES `postgres` — so match that value instead.
+fn connection_pool_database(config: &ConnectionConfig) -> Option<&str> {
+    let database = if database_capabilities::is_agent_type(&config.db_type) {
+        config.effective_database()
+    } else {
+        config.database.as_deref()
+    };
+    database.map(str::trim).filter(|database| !database.is_empty())
+}
+
+/// Whether the pool published when the client opened the connection holds a session that
+/// can read `database`'s metadata.
+///
+/// Oracle keeps one connection-level Agent session across schemas (mirroring
+/// `shares_database_pool_with_connection`), so any schema is serviceable. Other families
+/// only borrow it when the saved/effective database is exactly the one being browsed.
+fn connection_pool_serves_database(config: &ConnectionConfig, database: &str) -> bool {
+    if shares_database_pool_with_connection(&config.db_type) {
+        return true;
+    }
+    let Some(pool_database) = connection_pool_database(config) else {
+        return false;
+    };
+    pool_database == database
+        || (database_capabilities::is_agent_type(&config.db_type) && pool_database.eq_ignore_ascii_case(database))
+}
+
 /// Always-present KingbaseES/Vastbase catalog used to discover a default database for
 /// legacy connections that were saved without one (see issue #9491).
 const LEGACY_POSTGRES_LIKE_PROBE_DATABASE: &str = "template1";
@@ -3244,6 +3299,117 @@ impl AppState {
         .await
     }
 
+    /// An already-open pool that a read-only metadata request may borrow for `database`.
+    ///
+    /// Opening a connection publishes a pool for its configured database, and every
+    /// query/data tab publishes a session pool for the tab's database. Those pools already
+    /// hold a live connection to the database the user is browsing, so the object browser
+    /// borrows one of them instead of paying another login (and, for Agent drivers, another
+    /// Agent session) merely to read the catalog.
+    ///
+    /// Safety rules: only read-only metadata families qualify (see
+    /// [`metadata_may_borrow_open_pool`]), the dedicated metadata pool must not already
+    /// exist, the candidate must be routing-available and idle (no registered query), and
+    /// manual-transaction or metadata-role sessions are never borrowed. Agent-family
+    /// connections only borrow their connection-level pool — their logical sessions may hold
+    /// a server-side query cursor between page fetches — while native PostgreSQL-family
+    /// connections may also borrow the most recently used idle session for the same database.
+    pub(crate) async fn borrowable_metadata_pool_key(
+        &self,
+        connection_id: &str,
+        config: &ConnectionConfig,
+        database: &str,
+    ) -> Option<String> {
+        let database = database.trim();
+        if !metadata_may_borrow_open_pool(config.db_type) {
+            return None;
+        }
+        // Kingbase runs on a Go Agent that pins one server connection per logical session
+        // and is bound to a single database: its connection-level pool can serve the
+        // connection-wide catalog reads, and table-data tabs publish the database pool that
+        // metadata can follow. Other families still require an explicit database.
+        let kingbase = config.db_type == DatabaseType::Kingbase;
+        if database.is_empty() && !kingbase {
+            return None;
+        }
+        let base_key = if database.is_empty() {
+            base_pool_key_for_config(Some(config), connection_id, None, None, false)
+        } else {
+            base_pool_key_for_config(Some(config), connection_id, Some(database), None, false)
+        };
+        let metadata_key = pool_key_for_session_role(Some(config), base_key.clone(), None, AgentSessionRole::Metadata);
+        let session_prefix = format!("{base_key}:session:");
+        let connection_pool_key = connection_id.to_string();
+        let connection_pool_serves_database = database.is_empty() || connection_pool_serves_database(config, database);
+        // Agent-driver sessions may hold a server-side query cursor between page fetches,
+        // so metadata only borrows the connection-level pool for them. Native
+        // PostgreSQL-family tabs are plain auto-commit catalog readers and can share an idle
+        // same-database session.
+        let borrow_workload_sessions = !database_capabilities::is_agent_type(&config.db_type);
+        let mut candidates: Vec<(u8, String)> = Vec::new();
+        {
+            let connections = self.connections.read().await;
+            // A cached metadata pool is shared by every metadata read; keep using it
+            // instead of silently moving metadata work onto a user session.
+            if connections.contains_key(&metadata_key) {
+                return None;
+            }
+            for (pool_key, pool) in connections.iter() {
+                if !pool.is_available_for_routing() {
+                    continue;
+                }
+                let priority = if *pool_key == connection_pool_key && connection_pool_serves_database {
+                    // The pool published when the client opened the connection.
+                    0
+                } else if kingbase && !database.is_empty() && *pool_key == base_key {
+                    // Kingbase table-data tabs share the database pool, so metadata follows
+                    // that same live session instead of opening another one.
+                    1
+                } else if borrow_workload_sessions
+                    && pool_key.starts_with(&session_prefix)
+                    && !pool_key.contains(":role:")
+                    && !is_manual_transaction_pool_key(pool_key)
+                {
+                    // A query/data tab session on the same database, borrowed only while idle.
+                    1
+                } else {
+                    continue;
+                };
+                candidates.push((priority, pool_key.clone()));
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let activity = self.pool_activity.read().await;
+        let best = candidates
+            .into_iter()
+            .filter(|(_, pool_key)| !self.running_queries.is_pool_active(pool_key))
+            .map(|(priority, pool_key)| {
+                let last_used_at_ms =
+                    activity.get(&pool_key).map(|entry| entry.last_used_at_ms.load(Ordering::Relaxed)).unwrap_or(0);
+                (priority, last_used_at_ms, pool_key)
+            })
+            .min_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))?;
+        drop(activity);
+        self.touch_pool_activity(&best.2).await;
+        Some(best.2)
+    }
+
+    /// Config lookup wrapper for callers that decide whether to open a session before
+    /// resolving the pool (see `EphemeralAgentMetadataSession`).
+    pub(crate) async fn borrowable_metadata_pool_key_for_database(
+        &self,
+        connection_id: &str,
+        database: &str,
+    ) -> Option<String> {
+        let config = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id)?.clone()
+        };
+        self.borrowable_metadata_pool_key(connection_id, &config, database).await
+    }
+
     pub(crate) async fn get_or_create_metadata_pool_for_session(
         &self,
         connection_id: &str,
@@ -3255,6 +3421,17 @@ impl AppState {
             configs.get(connection_id).cloned()
         };
         let pool_database = metadata_pool_database(config.as_ref(), database);
+        // Prefer a connection/session the client already opened for this database before
+        // creating the dedicated metadata pool (and its extra physical connections).
+        if client_session_id.is_none() {
+            if let Some(config) = config.as_ref() {
+                if let Some(pool_key) =
+                    self.borrowable_metadata_pool_key(connection_id, config, pool_database.unwrap_or("")).await
+                {
+                    return Ok(pool_key);
+                }
+            }
+        }
         self.get_or_create_pool_for_session_inner(
             connection_id,
             pool_database,
@@ -15339,6 +15516,198 @@ for line in sys.stdin:
 
         assert!(state.close_database_pool("conn", Some("analytics")).await.unwrap());
         assert!(state.connections.read().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metadata_reuses_the_connection_pool_opened_for_its_database() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Postgres;
+        config.database = Some("app".to_string());
+        state.configs.write().await.insert(config.id.clone(), config);
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(pool));
+
+        let pool_key = state.get_or_create_metadata_pool_for_session("conn", Some("app"), None).await.unwrap();
+
+        // The pool published by connect_db serves this database, so metadata borrows it
+        // instead of opening a dedicated metadata pool.
+        assert_eq!(pool_key, "conn");
+        assert!(!state.connections.read().await.contains_key("conn:app"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metadata_reuses_an_idle_workload_session_for_the_same_database() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Postgres;
+        config.database = Some("maintenance".to_string());
+        state.configs.write().await.insert(config.id.clone(), config);
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+
+        {
+            let mut conns = state.connections.write().await;
+            conns.insert("conn".to_string(), PoolKind::Sqlite(pool.clone()));
+            conns.insert("conn:app:session:tab-1".to_string(), PoolKind::Sqlite(pool));
+        }
+
+        let pool_key = state.get_or_create_metadata_pool_for_session("conn", Some("app"), None).await.unwrap();
+
+        // The opened connection targets "maintenance", so the idle table-data session for
+        // "app" is the pool that already holds a live connection to the browsed database.
+        assert_eq!(pool_key, "conn:app:session:tab-1");
+        assert!(!state.connections.read().await.contains_key("conn:app"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metadata_borrow_skips_busy_sessions_manual_transactions_and_existing_metadata_pools() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Postgres;
+        config.database = Some("maintenance".to_string());
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+
+        {
+            let mut conns = state.connections.write().await;
+            conns.insert("conn:app:session:tab-1".to_string(), PoolKind::Sqlite(pool.clone()));
+            conns.insert("conn:app:session:manual-txn-1".to_string(), PoolKind::Sqlite(pool));
+        }
+        let registered = state.running_queries.register("exec-1".to_string());
+        state.running_queries.set_pool_key("exec-1", "conn:app:session:tab-1");
+
+        // A session running a statement must never receive metadata work.
+        assert!(state.borrowable_metadata_pool_key("conn", &config, "app").await.is_none());
+        drop(registered);
+
+        // The same session becomes eligible again once its statement finished.
+        assert_eq!(
+            state.borrowable_metadata_pool_key("conn", &config, "app").await.as_deref(),
+            Some("conn:app:session:tab-1")
+        );
+
+        // A manual-transaction session keeps its own connection to itself: remove the idle
+        // tab session so the manual-transaction one is the only remaining candidate.
+        state.connections.write().await.remove("conn:app:session:tab-1");
+        assert!(state.borrowable_metadata_pool_key("conn", &config, "app").await.is_none());
+
+        // Once the dedicated metadata pool exists it stays the metadata entry point.
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn:app".to_string(), PoolKind::Sqlite(pool));
+        assert!(state.borrowable_metadata_pool_key("conn", &config, "app").await.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metadata_borrow_leaves_session_scoped_metadata_families_alone() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(Some("app"));
+        config.id = "conn".to_string();
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(pool));
+
+        // MySQL metadata depends on the pool's own USE/SET state, so the open connection is
+        // not borrowed even though it targets the same database.
+        assert!(state.borrowable_metadata_pool_key("conn", &config, "app").await.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn kingbase_metadata_reuses_the_connection_pool_without_a_database() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Kingbase;
+        config.database = Some("app".to_string());
+        state.configs.write().await.insert(config.id.clone(), config);
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(pool));
+
+        // Opening the connection already pinned a Kingbase session; listing databases must
+        // not open a second one.
+        let pool_key = state.get_or_create_metadata_pool_for_session("conn", None, None).await.unwrap();
+
+        assert_eq!(pool_key, "conn");
+        assert!(!state.connections.read().await.contains_key("conn:role:metadata"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn kingbase_metadata_follows_the_shared_table_data_pool() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Kingbase;
+        config.database = Some("postgres".to_string());
+        state.configs.write().await.insert(config.id.clone(), config);
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+
+        {
+            let mut conns = state.connections.write().await;
+            // The connection-level session targets another database; table-data tabs
+            // published the browsed database's shared pool.
+            conns.insert("conn".to_string(), PoolKind::Sqlite(pool.clone()));
+            conns.insert("conn:app".to_string(), PoolKind::Sqlite(pool));
+        }
+
+        let pool_key = state.get_or_create_metadata_pool_for_session("conn", Some("app"), None).await.unwrap();
+
+        assert_eq!(pool_key, "conn:app");
+        assert!(!state.connections.read().await.contains_key("conn:app:role:metadata"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn agent_metadata_borrows_only_the_connection_pool_not_a_tab_session() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Dameng;
+        config.database = Some("APP".to_string());
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+
+        // A table-data tab on the same database must not receive metadata work: an Agent
+        // session can hold a server-side query cursor between fetches.
+        {
+            let mut conns = state.connections.write().await;
+            conns.insert("conn:APP:session:tab-1".to_string(), PoolKind::Sqlite(pool.clone()));
+        }
+        assert!(state.borrowable_metadata_pool_key("conn", &config, "APP").await.is_none());
+
+        // The pool published when the client opened the connection is the safe target.
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(pool));
+        assert_eq!(state.borrowable_metadata_pool_key("conn", &config, "APP").await.as_deref(), Some("conn"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn oracle_metadata_borrows_its_shared_connection_pool_for_any_schema() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Oracle;
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(pool));
+
+        // Oracle keeps one connection-level Agent session across schemas.
+        assert_eq!(state.borrowable_metadata_pool_key("conn", &config, "APP").await.as_deref(), Some("conn"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

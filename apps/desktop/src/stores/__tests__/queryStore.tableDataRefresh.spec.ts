@@ -540,6 +540,35 @@ describe("queryStore table data refresh", () => {
     expect(mocks.executeMulti).toHaveBeenCalledWith("yasdb-1", "app", "SELECT * FROM app.users", undefined, expect.any(String), expect.not.objectContaining({ rowOffset: expect.anything() }));
   });
 
+  it("shares the database pool for Kingbase table-data tabs", async () => {
+    mocks.getConnectionConfig.mockReturnValue({
+      id: "kingbase-1",
+      name: "Kingbase",
+      db_type: "kingbase",
+      database: "app",
+      query_timeout_secs: 30,
+    });
+    mocks.buildTableSelectSql.mockResolvedValue("SELECT * FROM app.users");
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("kingbase-1", "app", "users", "data");
+    store.setTableMeta(tabId, {
+      tableName: "users",
+      tableType: "TABLE",
+      columns: [{ name: "id", data_type: "int", is_nullable: false, column_default: null, is_primary_key: true, extra: null }],
+      primaryKeys: ["id"],
+    });
+
+    await store.refreshDataTab(tabId);
+
+    // Kingbase's Go Agent pins one server connection per logical session. Table-data pages
+    // are stateless, so they reuse the database pool instead of opening a session per table
+    // (opening many tables would otherwise exhaust the server's max_connections).
+    const options = mocks.executeMulti.mock.calls.at(-1)?.[5] as Record<string, unknown> | undefined;
+    expect(options).toBeDefined();
+    expect(options?.clientSessionId).toBeUndefined();
+  });
+
   it("continues and restarts Cassandra table cursors without duplicating page one", async () => {
     mocks.getConnectionConfig.mockReturnValue({
       id: "cassandra-1",
