@@ -88,7 +88,7 @@ import { nextRedisCommandDb } from "@/lib/redis/redisCommandSession";
 import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
 import { extractGraphCells, graphResultRows, mergeGraphResults } from "@/lib/graph/graphResult";
 import { formatRedisConsoleValue } from "@/lib/redis/redisValuePresentation";
-import { usesAgentCursorForQuery, usesAgentCursorForTableData } from "@/lib/database/databaseDriverManifest";
+import { dataTabsShareConnectionPool, usesAgentCursorForQuery, usesAgentCursorForTableData } from "@/lib/database/databaseDriverManifest";
 import { connectionIsDorisFamilyCatalogCapable, defaultAutoCommitForDbType, supportsClearableQuerySchema, supportsTransaction, usesOracleStickyTransactionState, usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, isViewTableType, postgresTupleLocatorUnsupportedEngine, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
@@ -8306,10 +8306,13 @@ export const useQueryStore = defineStore("query", () => {
           const connection = useConnectionStore().getConfig(options.connectionId);
           const databaseType = effectiveDatabaseTypeForConnection(connection);
           const usesQuerySession = sqlServerCountUsesLocalTempTable(databaseType, countTarget.sql);
-          const clientSessionId = usesQuerySession ? tabClientSessionId({ id: options.tabId }) : tabClientSessionId({ id: options.tabId }, "count");
-          if (!usesQuerySession) isolatedClientSessionId = clientSessionId;
+          // Shared-pool engines must not open a temporary count session: each session pins
+          // a physical server connection and a burst of counts would exhaust a busy server.
+          const sharesConnectionPool = !usesQuerySession && dataTabsShareConnectionPool(databaseType);
+          const clientSessionId = usesQuerySession ? tabClientSessionId({ id: options.tabId }) : sharesConnectionPool ? undefined : tabClientSessionId({ id: options.tabId }, "count");
+          if (clientSessionId && !usesQuerySession) isolatedClientSessionId = clientSessionId;
           countResult = await api.executeQuery(options.connectionId, options.database, countTarget.sql, countTarget.schema, countExecutionId, {
-            clientSessionId,
+            ...(clientSessionId ? { clientSessionId } : {}),
             catalog: options.catalog,
             timeoutSecs: options.timeoutSecs,
           });
@@ -8393,10 +8396,11 @@ export const useQueryStore = defineStore("query", () => {
         countResult = txnResults.find((result) => result.columns.length > 0) ?? txnResults[txnResults.length - 1];
       } else {
         const usesQuerySession = sqlServerCountUsesLocalTempTable(databaseType, tab.resultCountSql);
-        const clientSessionId = usesQuerySession ? tabClientSessionId(tab) : tabClientSessionId(tab, "count");
-        if (!usesQuerySession) isolatedClientSessionId = clientSessionId;
+        const sharesConnectionPool = !usesQuerySession && dataTabsShareConnectionPool(databaseType);
+        const clientSessionId = usesQuerySession ? tabClientSessionId(tab) : sharesConnectionPool ? undefined : tabClientSessionId(tab, "count");
+        if (clientSessionId && !usesQuerySession) isolatedClientSessionId = clientSessionId;
         countResult = await api.executeQuery(target.connectionId, target.database, tab.resultCountSql, target.schema, undefined, {
-          clientSessionId,
+          ...(clientSessionId ? { clientSessionId } : {}),
           catalog: target.catalog,
           maxRows: 1,
           timeoutSecs: queryTimeoutSecsForConnection(connection, useSettingsStore().editorSettings.globalQueryTimeoutSecs),
@@ -9542,7 +9546,11 @@ export const useQueryStore = defineStore("query", () => {
         useLargeValuePreview = !!meta && /^(?:BASE )?TABLE$/i.test(meta.tableType ?? "") && columnsAllowDeferredLobMarkers(meta.columns) && meta.columns.some((column) => /^(N?CLOB|BLOB)$/i.test(column.data_type.trim()));
       }
       const sourceLabelDatabase = targetDatabase || conn?.database;
-      const executionClientSessionId = options?.pagination?.clientSessionId ?? (tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined);
+      // Kingbase's Go Agent pins one server connection per logical session. Table-data
+      // pages are stateless, so reuse the database pool instead of opening a session per
+      // table (opening many tables otherwise exhausts the server's max_connections).
+      const dataTabSharesPool = tab.mode === "data" && dataTabsShareConnectionPool(conn?.db_type);
+      const executionClientSessionId = options?.pagination?.clientSessionId ?? (dataTabSharesPool ? undefined : tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined);
       const deferLobs = conn?.db_type === "jdbc" && (tab.mode === "query" || tab.mode === "data");
       const legacyExportSource = conn
         ? {

@@ -6,6 +6,7 @@ import {
   databaseProductCapabilities,
   databaseRuntimeMode,
   databaseTransferSupportLevel,
+  dataTabsShareConnectionPool,
   supportsDatabaseCompareMode,
   supportsDatabaseFeature,
   usesAgentCursorForQuery,
@@ -60,6 +61,14 @@ describe("databaseDriverManifest", () => {
     expect(usesAgentCursorForTableData("sqlserver")).toBe(false);
     expect(usesAgentCursorForTableData("jdbc")).toBe(false);
     expect(usesAgentCursorForTableData("prestosql")).toBe(false);
+  });
+
+  it("reuses the shared database pool for Kingbase table tabs", () => {
+    expect(dataTabsShareConnectionPool("kingbase")).toBe(true);
+    expect(dataTabsShareConnectionPool("postgres")).toBe(false);
+    expect(dataTabsShareConnectionPool("oracle")).toBe(false);
+    expect(dataTabsShareConnectionPool("jdbc")).toBe(false);
+    expect(dataTabsShareConnectionPool(undefined)).toBe(false);
   });
 
   it("exposes connection defaults from the shared manifest", () => {

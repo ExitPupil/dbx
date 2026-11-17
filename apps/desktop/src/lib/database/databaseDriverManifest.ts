@@ -183,6 +183,20 @@ export function usesAgentCursorForTableData(dbType?: DatabaseType, driverProfile
   return dbType === "cassandra" || (dbType === "sqlserver" && driverProfile?.trim().toLowerCase() === "sqlserver-legacy");
 }
 
+/**
+ * Table-data tabs reuse the connection's database-scoped pool instead of opening a
+ * tab-scoped session pool.
+ *
+ * Kingbase runs on a Go Agent that pins one server connection per logical session
+ * (`SetMaxOpenConns(1)`), so a per-tab session would hold a physical connection for every
+ * open table and exhaust small `max_connections` budgets. Table-data reads are stateless
+ * LIMIT/OFFSET pages, so sharing the database pool keeps the table count independent from
+ * the server connection count.
+ */
+export function dataTabsShareConnectionPool(dbType?: DatabaseType): boolean {
+  return dbType === "kingbase";
+}
+
 function productCapabilities(overrides: Partial<DatabaseProductCapabilities>): DatabaseProductCapabilities {
   const capabilities = Object.fromEntries(DATABASE_PRODUCT_CAPABILITY_KEYS.map((key) => [key, false])) as DatabaseProductCapabilities;
   return { ...capabilities, ...overrides };
